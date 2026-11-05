@@ -1,0 +1,154 @@
+name: Observer-Firmware bauen
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream-Tag, z. B. repeater-v1.18.0 (leer = neuester)"
+        required: false
+        default: ""
+  schedule:
+    # täglich prüfen, ob es einen neuen Upstream-Repeater-Release gibt
+    - cron: "17 4 * * *"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  UPSTREAM: meshcore-dev/MeshCore
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.r.outputs.tag }}
+      version: ${{ steps.r.outputs.version }}
+      build: ${{ steps.r.outputs.build }}
+    steps:
+      - id: r
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG=$(git ls-remote --tags --refs "https://github.com/$UPSTREAM" 'repeater-v*' \
+              | sed 's#.*refs/tags/##' \
+              | grep -E '^repeater-v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V | tail -1)
+          fi
+          VERSION="${TAG#repeater-}"
+          echo "Upstream-Tag: $TAG  ->  Version: $VERSION"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ] && gh release view "observer-$VERSION" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release observer-$VERSION existiert bereits – nichts zu tun."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        env:
+          - Heltec_v3_repeater
+          - heltec_v4_repeater
+          - RAK_4631_repeater
+          - Xiao_S3_WIO_repeater
+          - Xiao_nrf52_repeater
+          - ProMicro_repeater
+    steps:
+      - name: Upstream-Quellcode holen (unverändert)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio/.cache
+          key: pio-${{ matrix.env }}-${{ needs.resolve.outputs.tag }}
+          restore-keys: pio-${{ matrix.env }}-
+
+      - name: PlatformIO installieren
+        run: pip install --upgrade platformio
+
+      - name: Firmware bauen
+        env:
+          # einzige Abweichung von der offiziellen Firmware:
+          PLATFORMIO_BUILD_FLAGS: "-D MESH_PACKET_LOGGING=1"
+          FIRMWARE_VERSION: ${{ needs.resolve.outputs.version }}-saarmesh
+        run: |
+          mkdir -p out
+          bash build.sh build-firmware "${{ matrix.env }}"
+          ls -la out
+
+      - name: Prüfen, ob Paket-Logging enthalten ist
+        run: |
+          strings ".pio/build/${{ matrix.env }}/firmware.elf" | grep -q 'RX, len=' \
+            && echo "Paket-Logging ist aktiv." \
+            || { echo "Paket-Logging fehlt!"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.env }}
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: Lizenz und Prüfsummen
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/$UPSTREAM/$TAG/license.txt" -o out/MeshCore-LICENSE.txt
+          cd out
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Herkunftsnachweis (Build Provenance) erstellen
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "out/*"
+
+      - name: Release-Text erzeugen
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          COMMIT=$(git ls-remote "https://github.com/$UPSTREAM" "refs/tags/$TAG^{}" | cut -c1-7)
+          [ -n "$COMMIT" ] || COMMIT=$(git ls-remote "https://github.com/$UPSTREAM" "refs/tags/$TAG" | cut -c1-7)
+          export TAG VERSION COMMIT
+          envsubst < release-notes.md > notes.md
+          { echo; echo '### SHA256'; echo '```'; cat out/SHA256SUMS.txt; echo '```'; } >> notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: observer-${{ needs.resolve.outputs.version }}
+          name: SaarMesh Observer-Firmware ${{ needs.resolve.outputs.version }}
+          body_path: notes.md
+          files: out/*
+          make_latest: true
